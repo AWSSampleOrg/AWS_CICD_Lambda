@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: "AWS::Serverless-2016-10-31"
+Description: CloudFormation Template of Pipeline
+
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  ProjectPrefix:
+    Type: String
+
+  ArtifactStoreBucket:
+    Type: String
+  StackName:
+    Type: String
+  RepositoryName:
+    Type: String
+  CodeBuildProjectName:
+    Type: String
+  BranchName:
+    Type: String
+  CodePipelineRoleArn:
+    Type: String
+  DeployRoleForCodePipelineArn:
+    Type: String
+  PackagedTemplateFilePath:
+    Type: String
+    Default: packaged_template.yml
+  DeployParamFile:
+    Type: String
+    Default: packages/app/param.json
+
+Conditions:
+  BranchMaster: !Equals [!Ref BranchName, "master"]
+
+# ------------------------------------------------------------#
+# Resource
+# ------------------------------------------------------------#
+Resources:
+  CodePipelineProd:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ProjectPrefix}CodePipeline-${BranchName}
+      RoleArn: !Ref CodePipelineRoleArn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStoreBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: DownloadSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                BranchName: !Ref BranchName
+                PollForSourceChanges: false
+                RepositoryName: !Ref RepositoryName
+              OutputArtifacts:
+                - Name: SourceCode
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - InputArtifacts:
+                - Name: SourceCode
+              Name: Package
+              ActionTypeId:
+                Category: Build
+                Provider: CodeBuild
+                Owner: AWS
+                Version: 1
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProjectName
+        - !If
+          - BranchMaster
+          - Name: Deploy
+            Actions:
+              - Name: CreateChangeSet
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: 1
+                InputArtifacts:
+                  - Name: SourceCode
+                  - Name: BuildOutput
+                Configuration:
+                  ActionMode: CHANGE_SET_REPLACE
+                  RoleArn: !Ref DeployRoleForCodePipelineArn
+                  StackName: !Ref StackName
+                  ChangeSetName: !Sub ${StackName}-changeset
+                  Capabilities: CAPABILITY_NAMED_IAM
+                  TemplatePath: !Sub BuildOutput::${PackagedTemplateFilePath}
+                  TemplateConfiguration: !Sub BuildOutput::${DeployParamFile}
+                RunOrder: 1
+              - Name: ExecuteChangeSet
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Provider: CloudFormation
+                  Version: 1
+                InputArtifacts:
+                  - Name: BuildOutput
+                Configuration:
+                  ActionMode: CHANGE_SET_EXECUTE
+                  ChangeSetName: !Sub ${StackName}-changeset
+                  StackName: !Ref StackName
+                RunOrder: 2
+          - !Ref AWS::NoValue

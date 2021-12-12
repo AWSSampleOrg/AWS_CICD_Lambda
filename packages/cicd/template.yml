@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: "AWS::Serverless-2016-10-31"
+Description: CloudFormation Template of Pipeline
+
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ""
+
+  BucketName:
+    Type: String
+    Default: ""
+  BuildSpec:
+    Type: String
+    Default: buildspec.yml
+  PackagedTemplateFilePath:
+    Type: String
+    Default: packaged_template.yml
+  DeployParamFile:
+    Type: String
+    Default: packages/app/param.json
+
+# ------------------------------------------------------------#
+# Resource
+# ------------------------------------------------------------#
+Resources:
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectPrefix}${BucketName}
+
+  # CodeCommit
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectPrefix}CodeCommit
+      RepositoryDescription: !Sub ${ProjectPrefix}CodeCommit
+
+  # CodeBuild
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}CodeBuildRole
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectPrefix}CodeBuildProject
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        EnvironmentVariables:
+          - Name: PACKAGED_TEMPLATE_FILE_PATH
+            Value: !Ref PackagedTemplateFilePath
+          - Name: S3_BUCKET
+            Value: !Ref ArtifactStoreBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Ref BuildSpec
+
+  CodeBuildProjectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${CodeBuildProject}
+
+  # IAM Role for CodePipeline to deploy lambdaResources
+  DeployRoleForCodePipeline:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}DeployRoleForCodePipeline
+
+  # IAM Role for Basic CodePipeline
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}CodePipelineRole
+
+  # EventBridge
+  OnPullRequestEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger CodeBuild project and lambda function on PR's in CodeCommit.
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        detail:
+          event:
+              - referenceDeleted
+              - referenceCreated
+          referenceType:
+            - branch
+          repositoryName:
+            - !Sub ${CodeCommitRepository.Name}
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CodePipelineOperatorFunction.Arn
+          Id: lambda
+
+  LambdaEvent:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CodePipelineOperatorFunction
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt OnPullRequestEventRule.Arn
+
+  # Lambda
+  CodePipelineOperatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: build/src
+      FunctionName: !Sub ${ProjectPrefix}create_pipeline
+      Handler: index.handler
+      MemorySize: 128
+      Role: !Sub ${LambdaRole.Arn}
+      Runtime: nodejs14.x
+      Timeout: 900
+      #X-Ray
+      Tracing: Active
+      Environment:
+        Variables:
+          PROJECT_PREFIX: !Ref ProjectPrefix
+          PIPELINE_ROLE_ARN: !Sub ${CodePipelineRole.Arn}
+          ARTIFACT_BUCKET: !Ref ArtifactStoreBucket
+          REPOSITORY_NAME: !GetAtt CodeCommitRepository.Name
+          CODEBUILD_PROJECT_NAME: !Ref CodeBuildProject
+          DEPLOY_ROLE_FOR_CODEPIPELINE_ARN: !GetAtt DeployRoleForCodePipeline.Arn
+          PACKAGED_TEMPLATE_FILE_PATH: !Ref PackagedTemplateFilePath
+          DEPLOY_PARAM_FILE: !Ref DeployParamFile
+
+  CodePipelineOperatorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CodePipelineOperatorFunction}
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}LambdaFunctionRoleForCodePipelineOperations

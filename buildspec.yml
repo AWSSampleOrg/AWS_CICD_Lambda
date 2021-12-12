@@ -1,0 +1,17 @@
+version: 0.2
+phases:
+  build:
+    commands:
+      - INITIAL_DIRECTORY=$(pwd)
+      - echo ${INITIAL_DIRECTORY} && ls -la
+      - yarn install
+      - yarn test
+  post_build:
+    commands:
+      - chmod +x ./packages/app/package.sh
+      - ./packages/app/package.sh
+artifacts:
+  files:
+    - packaged_template.yml
+    - packages/app/param.json
+  discard-paths: no
